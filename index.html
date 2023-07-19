@@ -1,0 +1,268 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html lang="ja">
+
+<head>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta name="viewport" content="width=device-width, user-scalable=yes">
+    <style>
+        body {
+            margin: 0;
+        }
+
+        video {
+            display: none;
+        }
+    </style>
+</head>
+
+<body>
+    <video id="video" playsinline></video>
+    <canvas id="canvas"></canvas>
+    <div id="console"><span id="fps"></span></div>
+    <script type="module">
+        // スクリプトの動的読み込み
+        const load_script = fname => {
+            return new Promise((resolve, reject) => {
+                const sc = document.createElement("script");
+                sc.type = "text/javascript";
+                sc.src = fname;
+                sc.onload = () => resolve();
+                sc.onerror = (e) => reject(e);
+                const s = document.getElementsByTagName("script")[0];
+                s.parentNode.insertBefore(sc, s);
+            });
+        };
+
+        // モデルの読み込み: fname 読み込み機械学習ファイル名
+        const load_model = async fname => {
+            console.log("loading ort.min.js");
+            await load_script("https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js");
+            console.log(`loading ${fname}`);
+            return await ort.InferenceSession.create(fname);
+        };
+
+        // userAgentの表示(デバッグ用)
+        // const el = document.createElement("div");
+        // el.innerText = navigator.userAgent;
+        // document.getElementsByTagName("body")[0].appendChild(el);
+
+        // 非同期でライブラリ、モデルファイルの読み込みを実施する。
+        let model = undefined;
+        load_model("yolox_nano_416_416.onnx").then(e => model = e);
+
+        // enumerateDevicesを実行する前にカメラ使用の権限を得るために一度 getUserMedia を実行する。
+        const temp_mediastream = await navigator.mediaDevices.getUserMedia({ video: true });
+        // getUserMediaで得られたmediaStreamは明示的にstopしないとandroid chromeの場合には2つ目以降のカメラデバイスをオープンできない。
+        temp_mediastream?.getTracks().forEach(e => e.stop());
+
+        // デバイスに装着されているカメラデバイス一覧を html のラジオボタンとして作成し、
+        // 選択されたカメラのデバイス情報を返す関数。処理は非同期で実施される。
+        const video_selection = async (parent) => {
+            const div = document.createElement("div");
+            const cls = "video_selection";
+            parent.appendChild(div)
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            console.log("devices", devices);
+            devices.filter((d) => d.kind == "videoinput").forEach((e, i) => {
+                const rd = document.createElement("input");
+                rd.id = e.deviceId;
+                rd.setAttribute("type", "radio");
+                rd.setAttribute("name", "videoinput");
+                rd.setAttribute("value", e.deviceId)
+                rd.classList.add(cls);
+                div.appendChild(rd);
+                const lb = document.createElement("label");
+                lb.setAttribute("for", rd.id);
+                lb.innerText = e.label.length === 0 ? `video ${i}` : e.label;
+                div.appendChild(lb);
+                div.appendChild(document.createElement("br"));
+            });
+            return new Promise((resolve, reject) => {
+                document.querySelectorAll(`.${cls}`).forEach(e => {
+                    e.addEventListener("change", (e) => {
+                        parent.removeChild(div);
+                        const device = devices.filter((d) => d.deviceId == e.target.value)[0];
+                        resolve(device)
+                    })
+                });
+            });
+        };
+
+        // カメラデバイスの取得、表示の開始
+        const device = await video_selection(document.getElementsByTagName("body")[0]);
+        const video = document.getElementById("video");
+        video.srcObject?.getTracks().forEach(e => e.stop());
+        video.srcObject = await navigator.mediaDevices.getUserMedia({ audio: false, video: { deviceId: device.deviceId }, zoom: true, });
+        video.play();
+        const settings = video.srcObject?.getTracks().filter(e => e.kind === "video")[0].getSettings() ??
+            { width: video.videoWidth || video.width, height: video.videoHeight || video.height };
+        console.log(settings);
+
+        // canvasの幅高さは、モデルの入力に合わせておく。
+        const canvas = document.getElementById("canvas");
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        canvas.width = 416;
+        canvas.height = 416;
+
+        // videoからcanvasに画像をコピーするときに、送り先のcanvasの方が幅高さが小さい場合はvideoの中心の一部を、
+        // 逆にcanvasの方が大きい場合はvideoをcanvasの中心に位置するようにコピーする。これはそのための、
+        // sx,sy,sWidth,sHeight,dx,dy,dWidth,dHeight
+        // (それぞれの意味は https://developer.mozilla.org/ja/docs/Web/API/CanvasRenderingContext2D/drawImage 参照)
+        const drect = [
+            Math.max(0, Math.trunc((settings.width - canvas.width) / 2)),
+            Math.max(0, Math.trunc((settings.height - canvas.height) / 2)),
+            Math.min(canvas.width, settings.width),
+            Math.min(canvas.height, settings.height),
+            Math.max(0, Math.trunc((canvas.width - settings.width) / 2)),
+            Math.max(0, Math.trunc((canvas.height - settings.height) / 2)),
+            Math.min(canvas.width, settings.width),
+            Math.min(canvas.height, settings.height),
+        ];
+
+        // 色を自動選択するためのパレット: クラスラベルを指定してすでにその色が割り当てられている場合はその色を出力し、
+        // まだ割り当てられていない場合は新しい色を割り当てる。
+        const pallet = {
+            _brewer_aired12: ['#a6cee3', '#1f78b4', '#b2df8a', '#33a02c', '#fb9a99', '#e31a1c',
+                '#fdbf6f', '#ff7f00', '#cab2d6', '#6a3d9a', '#ffff99', '#b15928'],
+            _classLabel_palletIdx: {},
+            color: function (class_label) {
+                const pallet_index = this._classLabel_palletIdx[class_label] ??
+                    Object.keys(this._classLabel_palletIdx).length % this._brewer_aired12.length;
+                this._classLabel_palletIdx[class_label] = pallet_index;
+                return this._brewer_aired12[pallet_index];
+            },
+        };
+
+        // fpsの描画関数
+        const draw_fps = (function (elem, interval_sec) {
+            let frame_count = 0;
+            let updated_time = -1;
+            return function () {
+                frame_count += 1;
+                const t = Math.trunc(Date.now() / 1000);
+                if (t >= updated_time + interval_sec) {
+                    elem.innerText = `${(frame_count / (t - updated_time)).toFixed(1)} fps`;
+                    frame_count = 0;
+                    updated_time = t;
+                }
+            };
+        })(document.getElementById("fps"), 2);
+
+        // htmlの描画関数
+        const render = async () => {
+            ctx.drawImage(video, ...drect);
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            ctx.putImageData(imageData, 0, 0);
+
+            if (model === undefined) {
+                // モデルファイルの読み込み中の場合
+                if (Math.trunc(Date.now() / 1000) % 2 === 0) {
+                    ctx.textAlign = "center";
+                    ctx.font = "20px sans-serif";
+                    ctx.fillText("loading yolox model", canvas.width / 2, canvas.height / 2);
+                }
+
+                requestAnimationFrame(render);
+                return;
+            }
+
+            // imageDataからtensorの元になるFloat32Arrayへのコピー
+            // チャネル数: imageData rgba4チャネル, float32 rgb3チャネル
+            // 要素の並び順: imageData rgba...のチャネルラストの[h,w,c], float32 rr..gg..bb のチャネルファースト[c,h,w]
+            const float32array = new Float32Array(canvas.width * canvas.height * 3);
+            for (let y = 0; y < canvas.height; y += 1) {
+                for (let x = 0; x < canvas.width; x += 1) {
+                    const pi = y * canvas.width + x;
+                    for (let i = 0; i < 3; i += 1) {
+                        float32array[pi + i * canvas.width * canvas.height] = imageData.data[pi * 4 + i];
+                    }
+                }
+            }
+            const tensor = new ort.Tensor("float32", float32array, [1, 3, canvas.height, canvas.width]);
+            const results = await model.run({ [model.inputNames?.[0]]: tensor });
+            ctx.font = "10px sans-serif";
+            ctx.textAlign = "left";
+
+            // 信頼度の高い bbox を抽出して、枠を描画する。
+            yolox_postprocess(results.modelOutput).forEach(obj => {
+                ctx.strokeStyle = pallet.color(obj.class);
+                ctx.strokeRect(...obj.bbox);
+                ctx.fillStyle = pallet.color(obj.class);
+                ctx.fillText(obj.class, obj.bbox[0], obj.bbox[1]);
+            });
+            // fps(frame per second)の描画
+            draw_fps();
+            requestAnimationFrame(render);
+        }
+
+        // yoloxの後処理: yoloxの出力はすべてのアンカーに紐づくbboxである。そこから信頼度の高いものだけをこの関数で抽出する。
+        // 引数のconf_threはオブジェクト検出の信頼度*クラス識別信頼度のしきい値で、これ以上の値を持つものだけが残される。
+        // nms_threは、隣り合うbboxが別のbboxとして扱われる最大のIoU値である。別ではないと扱われる場合、信頼度の低い方は削除される。
+        // IoUはbboxの重なり具合であり1に近いほど類似したbboxとなる。
+        // each_classは、trueにすると隣り合うbboxでもクラス値が違うと抽出対象になる。falseの場合はクラス値が違っていても信頼度の小さい隣り合うbboxは抽出されない。
+        const yolox_postprocess = (modelOutput, conf_thre = 0.7, nms_thre = 0.45, each_class = false) => {
+            const coco_class_labels = [
+                "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "trafficlight",
+                "firehydrant", "stopsign", "parkingmeter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+                "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+                "skis", "snowboard", "sportsball", "kite", "baseballbat", "baseballglove", "skateboard", "surfboard", "tennisracket", "bottle",
+                "wineglass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+                "broccoli", "carrot", "hotdog", "pizza", "donut", "cake", "chair", "couch", "pottedplant", "bed",
+                "diningtable", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cellphone", "microwave", "oven",
+                "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddybear", "hairdrier", "toothbrush",
+            ];
+            // 出力候補数
+            const num_cands = modelOutput.dims[1];
+            const indices = [...Array(num_cands).keys()];
+            // 1つの出力候補の要素数
+            const num_vals = modelOutput.dims[2];
+            // max class score and index [[class pred,class label index],....]
+            const class_preds = indices.map(
+                i => modelOutput.data.slice(i * num_vals + 5, (i + 1) * num_vals).reduce((a, e, i) => a[0] >= e ? a : [e, i], [0, -1])
+            );
+            const class_obj_preds = class_preds.map(
+                (e, i) => ({
+                    class_pred: e[0],
+                    obj_pred: modelOutput.data[i * num_vals + 4],
+                    class_index: e[1], class_obj_pred: modelOutput.data[i * num_vals + 4] * e[0]
+                })
+            );
+            const detected_indices = indices.filter(i => class_obj_preds[i].class_obj_pred >= conf_thre)
+                .sort((i0, i1) => class_obj_preds[i1].class_obj_pred - class_obj_preds[i0].class_obj_pred)
+
+            const _iou = (b0, b1) => {
+                const [c0, c1] = [b0, b1].map(b => [b[0] - b[2] / 2, b[1] - b[3] / 2, b[0] + b[2] / 2, b[1] + b[3] / 2]);
+                const intersect = Math.max(0, Math.min(c0[2], c1[2]) - Math.max(c0[0], c1[0])) *
+                    Math.max(0, Math.min(c0[3], c1[3]) - Math.max(c0[1], c1[1]));
+                const union = [b0, b1].map(e => e[2] * e[3]).reduce((a, e) => a + e) - intersect;
+                return intersect / union;
+            }
+
+            const nms_out_indices = [];
+            let open_indices = [...detected_indices];
+            while (open_indices.length > 0) {
+                nms_out_indices.push(open_indices.shift());
+                const i0 = nms_out_indices[nms_out_indices.length - 1];
+                const cls_index0 = class_obj_preds[i0].class_index;
+                const bbox0 = modelOutput.data.slice(i0 * num_vals, i0 * num_vals + 4);
+                open_indices = open_indices.filter(i1 =>
+                    (each_class && cls_index0 !== class_obj_preds[i1].class_index) ||
+                    _iou(bbox0, modelOutput.data.slice(i1 * num_vals, i1 * num_vals + 4)) < nms_thre);
+            }
+
+            return nms_out_indices.map(i => ({
+                bbox: [
+                    modelOutput.data[i * num_vals + 0] - modelOutput.data[i * num_vals + 2] / 2,
+                    modelOutput.data[i * num_vals + 1] - modelOutput.data[i * num_vals + 3] / 2,
+                    modelOutput.data[i * num_vals + 2],
+                    modelOutput.data[i * num_vals + 3],
+                ],
+                class: coco_class_labels?.[class_obj_preds[i].class_index],
+            }));
+        };
+
+        requestAnimationFrame(render);
+    </script>
+</body>
+
+</html>
