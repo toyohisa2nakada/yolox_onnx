@@ -16,7 +16,7 @@
 </head>
 
 <body>
-    <video id="video" playsinline></video>
+    <video id="video" playsinline="true" muted="true" autoplay="true"></video>
     <canvas id="canvas"></canvas>
     <div id="console"><span id="fps"></span></div>
     <script type="module">
@@ -93,7 +93,7 @@
         const video = document.getElementById("video");
         video.srcObject?.getTracks().forEach(e => e.stop());
         video.srcObject = await navigator.mediaDevices.getUserMedia({ audio: false, video: { deviceId: device.deviceId }, zoom: true, });
-        video.play();
+        await video.play();
         const settings = video.srcObject?.getTracks().filter(e => e.kind === "video")[0].getSettings() ??
             { width: video.videoWidth || video.width, height: video.videoHeight || video.height };
         console.log(settings);
@@ -155,8 +155,11 @@
             ctx.putImageData(imageData, 0, 0);
 
             if (model === undefined) {
+                // ctx.fillStyle = "white";
+                // ctx.fillRect(0, 0, canvas.width, canvas.height);
                 // モデルファイルの読み込み中の場合
                 if (Math.trunc(Date.now() / 1000) % 2 === 0) {
+                    ctx.fillStyle = "black";
                     ctx.textAlign = "center";
                     ctx.font = "20px sans-serif";
                     ctx.fillText("loading yolox model", canvas.width / 2, canvas.height / 2);
