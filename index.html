@@ -17,8 +17,11 @@
 
 <body>
     <video id="video" playsinline="true" muted="true" autoplay="true"></video>
-    <canvas id="canvas"></canvas>
-    <div id="console"><span id="fps"></span></div>
+    <canvas id="canvas" width="0" height="0"></canvas>
+    <div id="console">
+        <div>model filename: <span id="model_filename"></span></div>
+        <div><span id="fps"></span></div>
+    </div>
     <script type="module">
         // スクリプトの動的読み込み
         const load_script = fname => {
@@ -35,20 +38,16 @@
 
         // モデルの読み込み: fname 読み込み機械学習ファイル名
         const load_model = async fname => {
+            document.getElementById("model_filename").innerText = fname;
             console.log("loading ort.min.js");
             await load_script("https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js");
             console.log(`loading ${fname}`);
             return await ort.InferenceSession.create(fname);
         };
 
-        // userAgentの表示(デバッグ用)
-        // const el = document.createElement("div");
-        // el.innerText = navigator.userAgent;
-        // document.getElementsByTagName("body")[0].appendChild(el);
-
         // 非同期でライブラリ、モデルファイルの読み込みを実施する。
         let model = undefined;
-        load_model("yolox_nano_416_416.onnx").then(e => model = e);
+        load_model(location.search.match(/^\?(.*)/)?.[1] ?? "yolox_nano_416_416.onnx").then(e => model = e);
 
         // enumerateDevicesを実行する前にカメラ使用の権限を得るために一度 getUserMedia を実行する。
         const temp_mediastream = await navigator.mediaDevices.getUserMedia({ video: true });
@@ -58,9 +57,12 @@
         // デバイスに装着されているカメラデバイス一覧を html のラジオボタンとして作成し、
         // 選択されたカメラのデバイス情報を返す関数。処理は非同期で実施される。
         const video_selection = async (parent) => {
-            const div = document.createElement("div");
+            const fset = document.createElement("fieldset");
             const cls = "video_selection";
-            parent.appendChild(div)
+            parent.insertBefore(fset, parent.firstChild)
+            const title = document.createElement("legend");
+            title.innerText = "please select camera device";
+            fset.appendChild(title);
             const devices = await navigator.mediaDevices.enumerateDevices();
             console.log("devices", devices);
             devices.filter((d) => d.kind == "videoinput").forEach((e, i) => {
@@ -70,17 +72,17 @@
                 rd.setAttribute("name", "videoinput");
                 rd.setAttribute("value", e.deviceId)
                 rd.classList.add(cls);
-                div.appendChild(rd);
+                fset.appendChild(rd);
                 const lb = document.createElement("label");
                 lb.setAttribute("for", rd.id);
                 lb.innerText = e.label.length === 0 ? `video ${i}` : e.label;
-                div.appendChild(lb);
-                div.appendChild(document.createElement("br"));
+                fset.appendChild(lb);
+                fset.appendChild(document.createElement("br"));
             });
             return new Promise((resolve, reject) => {
                 document.querySelectorAll(`.${cls}`).forEach(e => {
                     e.addEventListener("change", (e) => {
-                        parent.removeChild(div);
+                        parent.removeChild(fset);
                         const device = devices.filter((d) => d.deviceId == e.target.value)[0];
                         resolve(device)
                     })
